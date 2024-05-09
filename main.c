@@ -72,6 +72,12 @@
 #include "nrf_log_ctrl.h"
 #include "nrf_log_default_backends.h"
 
+#include <stdint.h>
+#include <stddef.h>
+
+#include "sandbar.h"
+#include "city.h"
+
 #define PCA10056_USE_FRONT_HEADER       0                                           /**< Use the front header (P24) for the camera module. Requires SB10-15 and SB20-25 to be soldered/cut, as described in the readme. */
 
 #define APP_BLE_CONN_CFG_TAG            1                                           /**< A tag identifying the SoftDevice BLE configuration. */
@@ -85,7 +91,7 @@
 
 #define APP_ADV_DURATION                18000                                       /**< The advertising duration (180 seconds) in units of 10 milliseconds. */
 
-#define MIN_CONN_INTERVAL               MSEC_TO_UNITS(15, UNIT_1_25_MS)             /**< Minimum acceptable connection interval (20 ms), Connection interval uses 1.25 ms units. */
+#define MIN_CONN_INTERVAL               MSEC_TO_UNITS(10, UNIT_1_25_MS)             /**< Minimum acceptable connection interval (20 ms), Connection interval uses 1.25 ms units. */
 #define MAX_CONN_INTERVAL               MSEC_TO_UNITS(15, UNIT_1_25_MS)             /**< Maximum acceptable connection interval (75 ms), Connection interval uses 1.25 ms units. */
 #define SLAVE_LATENCY                   0                                           /**< Slave latency. */
 #define CONN_SUP_TIMEOUT                MSEC_TO_UNITS(4000, UNIT_10_MS)             /**< Connection supervisory timeout (4 seconds), Supervision Timeout uses 10 ms units. */
@@ -731,6 +737,49 @@ void data_len_set(uint8_t value)
 }
 
 
+uint16_t update_crc16(uint16_t crc, const uint8_t *data, size_t length) {
+    uint16_t poly = 0x1021;  // CRC-16-CCITT polynomial
+    for (size_t i = 0; i < length; i++) {
+        crc ^= (uint16_t)(data[i] << 8);
+        for (uint8_t bit = 0; bit < 8; bit++) {
+            if (crc & 0x8000) {
+                crc = (crc << 1) ^ poly;
+            } else {
+                crc <<= 1;
+            }
+        }
+    }
+    return crc;
+}
+
+unsigned char* _static_img = NULL;
+uint32_t _static_img_len = 0;
+uint32_t _static_img_pos = 0;
+void sandbar_capture_image() {
+    if(_static_img == _city_img) {
+        _static_img = _sandbar_img;
+        _static_img_len = _sandbar_img_len;
+    } else {
+        _static_img = _city_img;
+        _static_img_len = _city_img_len;
+    }
+    _static_img_pos = 0;
+}
+
+uint32_t sandbar_img_bytes_available() {
+    return _static_img_len - _static_img_pos;
+}
+
+uint32_t sandbar_fill_buffer(uint8_t *buffer, uint32_t bufferSize) {
+    uint32_t bytesToRead = _static_img_len - _static_img_pos;
+    if (bytesToRead > bufferSize) {
+        bytesToRead = bufferSize;
+    }
+    memcpy(buffer, _static_img + _static_img_pos, bytesToRead);
+    _static_img_pos += bytesToRead;
+    return bytesToRead;
+}
+
 /**@brief Application main function.
  */
 int main(void)
@@ -758,6 +807,10 @@ int main(void)
 
     advertising_start();
 
+    int first = 0;
+    int remaining_image_size = 0;
+    uint16_t crc = 0xFFFF;  // Initial CRC value
+
     // Enter main loop.
     for (;;)
     {
@@ -774,12 +827,16 @@ int main(void)
                     if(arducam_mini_2mp_bytesAvailable() == 0)
                     {
                         NRF_LOG_INFO("Starting capture...");
-                        arducam_mini_2mp_startSingleCapture();
-                        image_size = arducam_mini_2mp_bytesAvailable();
+                        //arducam_mini_2mp_startSingleCapture();
+                        //image_size = arducam_mini_2mp_bytesAvailable();
+                        sandbar_capture_image();
+                        image_size = sandbar_img_bytes_available();
                         NRF_LOG_INFO("Capture complete: size %i bytes", (int)(image_size));
                         ble_its_img_info_t image_info;
                         image_info.file_size_bytes = image_size;
                         ble_its_img_info_send(&m_its, &image_info);
+                        first = 1;
+                        remaining_image_size = image_size;
                     }
                     break;
             
@@ -841,11 +898,14 @@ int main(void)
         
         if(m_stream_mode_active)
         {
-            if(img_data_length == 0 && arducam_mini_2mp_bytesAvailable() == 0)
+            //if(img_data_length == 0 && arducam_mini_2mp_bytesAvailable() == 0)
+            if(img_data_length == 0 && sandbar_img_bytes_available() == 0)
             {
-                arducam_mini_2mp_startSingleCapture();
+                // arducam_mini_2mp_startSingleCapture();
+                sandbar_capture_image();
 
-                image_size = arducam_mini_2mp_bytesAvailable();
+                // image_size = arducam_mini_2mp_bytesAvailable();
+                image_size = sandbar_img_bytes_available();
                 
                 ble_its_img_info_t image_info;
                 image_info.file_size_bytes = image_size;
@@ -853,21 +913,46 @@ int main(void)
             }
         }
         
-        if(img_data_length > 0 || arducam_mini_2mp_bytesAvailable() > 0)
+        // if(img_data_length > 0 || arducam_mini_2mp_bytesAvailable() > 0)
+        if(img_data_length > 0 || sandbar_img_bytes_available() > 0)
         {
+            //NRF_LOG_INFO("kirak send image");
             uint32_t ret_code;
+
+            if(first == 1) {
+              first = 0;
+              NRF_LOG_INFO("kirak total size %i", (int)(remaining_image_size));
+              crc = 0xFFFF;  
+            }
+
             do
             {
                 if(img_data_length == 0)
                 {
-                    img_data_length = arducam_mini_2mp_fillBuffer(img_data_buffer, m_ble_its_max_data_len);
+                    // img_data_length = arducam_mini_2mp_fillBuffer(img_data_buffer, m_ble_its_max_data_len);
+                    img_data_length = sandbar_fill_buffer(img_data_buffer, m_ble_its_max_data_len);
                 }
                 ret_code = ble_its_send_file_fragment(&m_its, img_data_buffer, img_data_length);
+                //NRF_LOG_INFO("kireak ret %i", (int)(ret_code));
+                //NRF_LOG_INFO("kireak fragment size %i", (int)(img_data_length));
+
                 if(ret_code == NRF_SUCCESS)
                 {
+                    remaining_image_size -= img_data_length;
+                    NRF_LOG_INFO("kireak remaining size %i", (int)(remaining_image_size));
+                    crc = update_crc16(crc, img_data_buffer, img_data_length);
+
                     img_data_length = 0;
-                }  
-            }while(ret_code == NRF_SUCCESS);    
+                    
+                    // if(remaining_image_size == 0 && arducam_mini_2mp_bytesAvailable() == 0) {
+                    if(remaining_image_size == 0 && sandbar_img_bytes_available() == 0) {
+                        NRF_LOG_INFO("kireak done");
+                        crc = ~crc;
+                        NRF_LOG_INFO("Calculated CRC: %u", (unsigned int)crc);
+                    }
+
+                }
+            }while(ret_code == NRF_SUCCESS);
         }
         
         if(m_new_command_received == APP_CMD_NOCOMMAND)
@@ -876,4 +961,3 @@ int main(void)
         }
     }
 }
-
